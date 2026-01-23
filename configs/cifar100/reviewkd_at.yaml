@@ -1,0 +1,20 @@
+EXPERIMENT:
+  NAME: "cifar100_baselines_Reviewkd_at3"
+  TAG: "pkt,res32x4,res8x4"
+  PROJECT: "/home/data/pyl/test_result"
+DISTILLER:
+  TYPE: "REVIEWKD_AT"
+  TEACHER: "resnet32x4"
+  STUDENT: "resnet8x4"
+REVIEWKD_AT:
+  REVIEWKD_WEIGHT: 20.0
+SOLVER:
+  BATCH_SIZE: 128
+  EPOCHS: 240
+  LR: 0.2
+  LR_DECAY_STAGES: [50, 100, 150,200]
+  LR_DECAY_RATE: 0.1
+  WEIGHT_DECAY: 0.0005
+  MOMENTUM: 0.9
+  TYPE: "SGD"
+

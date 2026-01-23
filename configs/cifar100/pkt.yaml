@@ -1,0 +1,17 @@
+EXPERIMENT:
+  NAME: "cifar100_baselines_PKT"
+  TAG: "pkt,res32x4,res8x4"
+  PROJECT: "/home/data/pyl/test_result"
+DISTILLER:
+  TYPE: "PKT"
+  TEACHER: "resnet32x4"
+  STUDENT: "resnet8x4"
+SOLVER:
+  BATCH_SIZE: 128
+  EPOCHS: 240
+  LR: 0.2
+  LR_DECAY_STAGES: [50, 100, 150,200]
+  LR_DECAY_RATE: 0.5
+  WEIGHT_DECAY: 0.0005
+  MOMENTUM: 0.9
+  TYPE: "SGD"

@@ -1,0 +1,20 @@
+EXPERIMENT:
+  NAME: "lung_baselines_swimtransformerv2_convnextv2_base_reviewkd"
+  TAG: "pkt,res32x4,res8x4"
+  PROJECT: "/home/data/pyl/test_result"
+DISTILLER:
+  TYPE: "REVIEWKD"
+  TEACHER: "swimtransformerv2"
+  STUDENT: "convnext_v2_tiny"
+REVIEWKD:
+  REVIEWKD_WEIGHT: 5.0
+SOLVER:
+  BATCH_SIZE: 32
+  EPOCHS: 100
+  LR: 5e-5
+  LR_DECAY_STAGES: [25,50,75]
+  LR_DECAY_RATE: 0.1
+  WEIGHT_DECAY: 1e-8
+  MOMENTUM: 0.9
+  TYPE: "AdamW"
+
