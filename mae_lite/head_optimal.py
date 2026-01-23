@@ -26,6 +26,7 @@ class OptimalPrototypeLoss(nn.Module):
     修复内容:
     1. Contrastive Loss 只作用于异类原型
     2. 支持 Class-Balanced 加权（适合严重长尾）
+    3. 【新增】CB 加权同时作用于 CE Loss 和 Cluster Loss
     """
     def __init__(
         self,
@@ -49,6 +50,9 @@ class OptimalPrototypeLoss(nn.Module):
         self.contrastive_scale = contrastive_scale
         self.use_class_balanced = use_class_balanced
         self.cb_beta = cb_beta
+        
+        # 缓存 CB 权重 (在第一次 forward 时计算)
+        self._cb_weights: Optional[torch.Tensor] = None
 
     def _get_class_weight(self, class_count: torch.Tensor) -> torch.Tensor:
         """计算类别权重"""
@@ -58,6 +62,21 @@ class OptimalPrototypeLoss(nn.Module):
         else:
             weights = 1.0 / torch.sqrt(class_count.float() + 1e-6)
         return weights / weights.sum() * self.num_classes
+    
+    def get_ce_weights(self, labels: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        获取 CE Loss 的类别权重
+        【新增】用于在 HeadOptimal.forward 中对 CE Loss 加权
+        """
+        if not self.use_class_balanced:
+            return None
+        
+        # 统计当前 batch 的类别分布
+        class_counts = torch.zeros(self.num_classes, device=labels.device)
+        for c in range(self.num_classes):
+            class_counts[c] = (labels == c).sum().float() + 1e-6  # 避免除零
+        
+        return self._get_class_weight(class_counts)
     
     def compute_cluster_loss(
         self,
@@ -250,20 +269,29 @@ class MixedAttentionBlockOptimal(nn.Module):
 
 
 class DynamicPrototypeManagerOptimal(nn.Module):
-    """优化的动态原型管理器 - 标准 EMA 动量更新"""
+    """
+    优化的动态原型管理器 - 标准 EMA 动量更新
+    
+    修复: 添加与 models_mae.py push_prototypes 兼容的 API:
+    - var_threshold: 方差阈值
+    - expand_prototypes (复数): 兼容旧 API
+    - apply_momentum_updates: 批量应用更新
+    """
     def __init__(
         self,
         num_classes: int,
         emb_dim: int,
         init_prototypes: int = 5,
         max_prototypes: int = 10,
-        momentum: float = 0.9
+        momentum: float = 0.9,
+        var_threshold: float = 0.5,  # 新增: 方差阈值
     ):
         super().__init__()
         self.num_classes = num_classes
         self.emb_dim = emb_dim
         self.max_prototypes = max_prototypes
         self.momentum = momentum
+        self.var_threshold = var_threshold  # 新增: 用于 push 时判断是否扩展原型
         
         self.register_buffer('protos_per_class', torch.tensor([init_prototypes] * num_classes))
         
@@ -272,6 +300,9 @@ class DynamicPrototypeManagerOptimal(nn.Module):
         nn.init.xavier_uniform_(self.prototypes)
         
         self.register_buffer('valid_mask', self._create_valid_mask())
+        
+        # 新增: 用于批量动量更新的缓存
+        self._pending_updates: Dict[int, torch.Tensor] = {}
     
     def _create_valid_mask(self) -> torch.Tensor:
         mask = torch.zeros(self.num_classes * self.max_prototypes, dtype=torch.bool)
@@ -294,6 +325,7 @@ class DynamicPrototypeManagerOptimal(nn.Module):
     
     @torch.no_grad()
     def expand_prototype(self, class_idx: int, new_proto: torch.Tensor) -> bool:
+        """扩展单个原型 (单数形式)"""
         if self.protos_per_class[class_idx] >= self.max_prototypes:
             return False
         new_idx = class_idx * self.max_prototypes + self.protos_per_class[class_idx].item()
@@ -303,8 +335,45 @@ class DynamicPrototypeManagerOptimal(nn.Module):
         return True
     
     @torch.no_grad()
+    def expand_prototypes(self, class_idx: int, new_proto: torch.Tensor) -> bool:
+        """
+        扩展原型 (复数形式) - 兼容 models_mae.py 的 API
+        实际上调用 expand_prototype
+        """
+        return self.expand_prototype(class_idx, new_proto)
+    
+    @torch.no_grad()
     def momentum_update(self, proto_idx: int, new_value: torch.Tensor):
-        """标准 EMA 更新"""
+        """
+        标准 EMA 更新 - 缓存更新，等待 apply_momentum_updates 批量应用
+        
+        这样设计是为了兼容 models_mae.py 的调用模式:
+        1. 多次调用 momentum_update 缓存更新
+        2. 最后调用 apply_momentum_updates 批量应用
+        """
+        self._pending_updates[proto_idx] = new_value.clone()
+    
+    @torch.no_grad()
+    def apply_momentum_updates(self):
+        """
+        批量应用所有缓存的动量更新
+        兼容 models_mae.py 的 push_prototypes 调用模式
+        """
+        for proto_idx, new_value in self._pending_updates.items():
+            new_value_norm = F.normalize(new_value, p=2, dim=-1)
+            self.prototypes.data[proto_idx] = (
+                self.momentum * self.prototypes.data[proto_idx] +
+                (1 - self.momentum) * new_value_norm
+            )
+            self.prototypes.data[proto_idx] = F.normalize(
+                self.prototypes.data[proto_idx], p=2, dim=-1
+            )
+        # 清空缓存
+        self._pending_updates.clear()
+    
+    @torch.no_grad()
+    def momentum_update_immediate(self, proto_idx: int, new_value: torch.Tensor):
+        """立即应用动量更新 (不缓存)"""
         new_value_norm = F.normalize(new_value, p=2, dim=-1)
         self.prototypes.data[proto_idx] = (
             self.momentum * self.prototypes.data[proto_idx] +
@@ -443,6 +512,8 @@ class HeadOptimal(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """
         返回格式: (logits, loss, loss_dict)
+        
+        【修复】CB 加权现在同时作用于 CE Loss 和 Cluster Loss
         """
         similarities, class_emb, _, proj_img_features = self.forward_features(
             pool_img_features, img_features
@@ -451,7 +522,12 @@ class HeadOptimal(nn.Module):
         logits = class_logits * self.temperature
         
         if self.training and labels is not None:
-            ce_loss = F.cross_entropy(logits, labels)
+            # 【修复】CE Loss 也使用 CB 加权
+            ce_weights = self.proto_loss_fn.get_ce_weights(labels)
+            if ce_weights is not None:
+                ce_loss = F.cross_entropy(logits, labels, weight=ce_weights)
+            else:
+                ce_loss = F.cross_entropy(logits, labels)
             
             proto_losses = self.proto_loss_fn(
                 similarities=similarities,
@@ -459,6 +535,7 @@ class HeadOptimal(nn.Module):
                 prototypes=self.proto_manager.prototypes,
                 proto_indices=self.proto_manager.get_prototype_indices(),
                 valid_mask=self.proto_manager.valid_mask
+            )
             )
             
             total_loss = (
