@@ -36,7 +36,11 @@ class Exp(BaseExp):
 
         #schedule
         self.sched = "warmcos_scale"
-        self.basic_lr_per_img = 1e-4 / batch_size
+        # 注意: 实际 LR = basic_lr_per_img * batch_size
+        # 设置 basic_lr_per_img = 5e-5 / 32，则 batch_size=32 时 LR = 5e-5
+        # 但之前设置错误导致 LR 太小
+        # 修正: 直接设置目标 LR，不再除以 batch_size
+        self.basic_lr_per_img = 1e-4 / 32  # 目标 LR = 1e-4 (batch=32时)
         self.warmup_lr = 0.0
         self.min_lr = 1e-6
         self.warmup_epochs = 1
@@ -63,8 +67,8 @@ class Exp(BaseExp):
         self.weights_prefix = ""
         # self.print_interval = 10
         # self.enable_tensorboard = True
-        self.pretrain_exp_name = "HiFuse_Small_1e-5-0.05"
-        self.save_folder_prefix = "ft_HiFuse_Small"
+        self.pretrain_exp_name = "HiFuse_Small_90"
+        self.save_folder_prefix = "90_HiFuse_Small"
 
     @property
     def exp_name(self):
@@ -116,7 +120,6 @@ class Exp(BaseExp):
             
             self.model = Model(self, encoder)
         return self.model
-        return self.model
 
     def get_optimizer(self):
         if "optimizer" not in self.__dict__:
@@ -127,21 +130,23 @@ class Exp(BaseExp):
             use_enhanced_model = getattr(self, 'use_enhanced_model', False)
             
             if use_enhanced_model:
-                # 使用差异化学习率
+                # 使用差异化学习率 (含 Head 预热支持)
                 from projects.mae_lite.mhf_enhancement import get_parameter_groups
                 
                 backbone_lr_scale = getattr(self, 'backbone_lr_scale', 0.1)
                 mhf_lr_scale = getattr(self, 'mhf_lr_scale', 0.5)
                 enhancement_lr_scale = getattr(self, 'enhancement_lr_scale', 1.0)
+                head_lr_scale = getattr(self, 'head_lr_scale', 2.0)  # Head 学习率倍率
                 
                 logger.info(f"Using differential learning rates:")
-                logger.info(f"  backbone: {backbone_lr_scale}x, mhf: {mhf_lr_scale}x, enhancement: {enhancement_lr_scale}x")
+                logger.info(f"  backbone: {backbone_lr_scale}x, mhf: {mhf_lr_scale}x, enhancement: {enhancement_lr_scale}x, head: {head_lr_scale}x")
                 
                 param_groups = get_parameter_groups(
                     self.get_model().model,
                     backbone_lr_scale=backbone_lr_scale,
                     mhf_lr_scale=mhf_lr_scale,
                     enhancement_lr_scale=enhancement_lr_scale,
+                    head_lr_scale=head_lr_scale,
                     base_lr=self.lr
                 )
                 
