@@ -248,8 +248,8 @@ class Exp(BaseExp):
         ckpt = torch.load(ckpt_path, map_location="cpu")
         weights_prefix = self.weights_prefix
         if not weights_prefix:
-            state_dict = {"model." + k: v for k, v in ckpt["state_dict"].items() if not _match(k)}
-            # state_dict = {"model." + k: v for k, v in ckpt.items() if not _match(k)}
+            # state_dict = {"model." + k: v for k, v in ckpt["state_dict"].items() if not _match(k)}
+            state_dict = {"model." + k: v for k, v in ckpt.items() if not _match(k)}
         else:
             if weights_prefix and not weights_prefix.endswith("."):
                 weights_prefix += "."
