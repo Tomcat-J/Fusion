@@ -22,7 +22,7 @@ class Exp(BaseExp):
         self.global_pool = True
 
         # dataset & model
-        self.dataset = "CommonDataSet"
+        self.dataset = "MyDataSet"
         self.img_size = 224
 
         #optimizer
