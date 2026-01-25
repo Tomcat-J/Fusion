@@ -569,25 +569,29 @@ def get_parameter_groups(model: nn.Module,
                         backbone_lr_scale: float = 0.1,
                         mhf_lr_scale: float = 0.5,
                         enhancement_lr_scale: float = 1.0,
+                        head_lr_scale: float = 2.0,
                         base_lr: float = 1e-4) -> List[Dict]:
     """
     获取分组的模型参数，用于差异化学习率
     
-    将模型参数分为三组:
+    将模型参数分为四组:
     1. backbone: ConvNeXt和Swin Transformer分支的参数 (预训练特征，需要保护)
     2. mhf_original: MHF_block的原始参数 (融合模块，需要适应新数据)
     3. enhancement: 新增增强模块的参数 (全新模块，需要快速学习)
+    4. head: 分类头参数 (需要快速收敛，尤其是多原型头)
     
     针对 ImageNet → 医学图像 的迁移学习场景，推荐配置:
     - backbone: 0.1x (保护预训练特征)
     - mhf_original: 0.5x (适度微调融合模块)
     - enhancement: 1.0x (快速学习新增模块)
+    - head: 2.0x (加速分类头收敛，尤其是多原型头)
     
     Args:
         model: main_model实例
         backbone_lr_scale: backbone学习率倍率，默认0.1
         mhf_lr_scale: MHF原始参数学习率倍率，默认0.5
         enhancement_lr_scale: 增强模块学习率倍率，默认1.0
+        head_lr_scale: 分类头学习率倍率，默认2.0
         base_lr: 基础学习率，默认1e-4
     
     Returns:
@@ -604,9 +608,12 @@ def get_parameter_groups(model: nn.Module,
     backbone_params = []
     mhf_original_params = []
     enhancement_params = []
+    head_params = []
     
     # MHF block名称模式 (fu1, fu2, fu3, fu4)
     mhf_patterns = ['fu1', 'fu2', 'fu3', 'fu4']
+    # Head 参数名称模式
+    head_patterns = ['head', 'proto', 'classifier', 'fc']
     
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -615,10 +622,13 @@ def get_parameter_groups(model: nn.Module,
         # 检查是否是增强模块参数
         if 'enhancement' in name:
             enhancement_params.append(param)
+        # 检查是否是 Head 参数 (分类头/原型头)
+        elif any(pattern in name.lower() for pattern in head_patterns):
+            head_params.append(param)
         # 检查是否是MHF_block原始参数 (不包含enhancement)
         elif any(pattern in name for pattern in mhf_patterns):
             mhf_original_params.append(param)
-        # 其他参数归类为backbone (ConvNeXt, Swin, head等)
+        # 其他参数归类为backbone (ConvNeXt, Swin等)
         else:
             backbone_params.append(param)
     
@@ -638,7 +648,15 @@ def get_parameter_groups(model: nn.Module,
             'lr': base_lr * enhancement_lr_scale, 
             'name': 'enhancement'
         },
+        {
+            'params': head_params, 
+            'lr': base_lr * head_lr_scale, 
+            'name': 'head'
+        },
     ]
+    
+    # 过滤空参数组
+    param_groups = [g for g in param_groups if len(g['params']) > 0]
     
     # 打印参数分组统计
     total_params = sum(p.numel() for group in param_groups for p in group['params'])
