@@ -254,7 +254,7 @@ class Exp(BaseExp):
     def __init__(self, batch_size, max_epoch=300):
         super(Exp, self).__init__(batch_size, max_epoch)
         # dataset & model
-        self.dataset = "CommonDataSet"
+        self.dataset = "MyDataSet"
         # self.dataset = "CIFAR100"
         self.encoder_arch = "HiFuse_Small"
         self.pretrained = False
@@ -386,23 +386,23 @@ class Exp(BaseExp):
                                            transforms.CenterCrop(img_size),
                                            transforms.ToTensor(),
                                            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])])}
-            train_images_path, train_images_label = read_train_data("/home/backup/lh/KD/data/ISIC2018_Task3/train")
-            val_images_path, val_images_label = read_val_data("/home/backup/lh/KD/data/ISIC2018_Task3/test")
-            dataset_train = build_dataset(self.dataset,images_path=train_images_path,
-                              images_class=train_images_label,
-                              transform=data_transform["train"])
-            dataset_eval = build_dataset(self.validation_dataset if self.validation_dataset else self.dataset, images_path=val_images_path,
-                            images_class=val_images_label,
-                            transform=data_transform["val"])
-            # train_images_path, train_images_label, val_images_path, val_images_label = read_split_data(
-            #     "/home/backup/lh/lung/data/kd3/test", "/home/backup/lh/lung/data/super_no_aug",
-            #     "/home/backup/lh/lung/data/kd3/val")
+            # train_images_path, train_images_label = read_train_data("/home/backup/lh/KD/data/ISIC2018_Task3/train")
+            # val_images_path, val_images_label = read_val_data("/home/backup/lh/KD/data/ISIC2018_Task3/test")
             # dataset_train = build_dataset(self.dataset,images_path=train_images_path,
             #                   images_class=train_images_label,
-            #                   transform=transform("train"))
+            #                   transform=data_transform["train"])
             # dataset_eval = build_dataset(self.validation_dataset if self.validation_dataset else self.dataset, images_path=val_images_path,
             #                 images_class=val_images_label,
-            #                 transform=transform("val"))
+            #                 transform=data_transform["val"])
+            train_images_path, train_images_label, val_images_path, val_images_label = read_split_data(
+                "/home/backup/lh/lung/data/kd3/test", "/home/backup/lh/lung/data/super_no_aug",
+                "/home/backup/lh/lung/data/kd3/val")
+            dataset_train = build_dataset(self.dataset,images_path=train_images_path,
+                              images_class=train_images_label,
+                              transform=transform("train"))
+            dataset_eval = build_dataset(self.validation_dataset if self.validation_dataset else self.dataset, images_path=val_images_path,
+                            images_class=val_images_label,
+                            transform=transform("val"))
             # dataset_test = build_dataset(self.test_dataset if self.test_dataset else self.dataset, images_path=test_images_path,
             #                 images_class=test_images_label,
             #                 transform=transform("test"))
