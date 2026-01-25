@@ -4,11 +4,12 @@
 基于以下分析设计:
 1. ProtoPNet: Push/Pull 机制
 2. 长尾数据平衡: Class-Balanced 加权
-3. 修复 Contrastive Loss: 只推开异类原型
+3. 类内软正交约束: 替代 Contrastive + Diversity
+4. 局部一致性约束: 同类样本的局部 patch 激活分布一致
 
 损失函数组成:
 L_total = L_ce + λ_clst * L_cluster + λ_sep * L_separation 
-        + λ_div * L_diversity + λ_cont * L_contrastive_fixed
+        + λ_orth * L_orthogonality + λ_local * L_local_consistency
 
 注意: 已移除 Abstention Loss，简化实现
 """
@@ -24,9 +25,10 @@ class OptimalPrototypeLoss(nn.Module):
     最优原型损失函数
     
     修复内容:
-    1. Contrastive Loss 只作用于异类原型
-    2. 支持 Class-Balanced 加权（适合严重长尾）
-    3. 【新增】CB 加权同时作用于 CE Loss 和 Cluster Loss
+    1. 类内软正交约束替代 Contrastive + Diversity
+    2. 局部一致性约束: 同类样本的局部 patch 激活分布一致
+    3. 支持 Class-Balanced 加权（适合严重长尾）
+    4. 【新增】CB 加权同时作用于 CE Loss 和 Cluster Loss
     """
     def __init__(
         self,
@@ -35,8 +37,10 @@ class OptimalPrototypeLoss(nn.Module):
         margin: float = 0.3,
         clst_scale: float = 0.8,
         sep_scale: float = 0.08,
-        div_scale: float = 0.01,
-        contrastive_scale: float = 0.05,
+        orth_scale: float = 0.01,
+        orth_threshold: float = 0.3,
+        local_scale: float = 0.01,
+        local_temperature: float = 0.1,
         use_class_balanced: bool = False,
         cb_beta: float = 0.9999,
     ):
@@ -46,8 +50,10 @@ class OptimalPrototypeLoss(nn.Module):
         self.margin = margin
         self.clst_scale = clst_scale
         self.sep_scale = sep_scale
-        self.div_scale = div_scale
-        self.contrastive_scale = contrastive_scale
+        self.orth_scale = orth_scale
+        self.orth_threshold = orth_threshold
+        self.local_scale = local_scale
+        self.local_temperature = local_temperature
         self.use_class_balanced = use_class_balanced
         self.cb_beta = cb_beta
         
@@ -144,65 +150,102 @@ class OptimalPrototypeLoss(nn.Module):
                 valid_classes += 1
         return sep_loss / max(valid_classes, 1)
     
-    def compute_diversity_loss(
+    def compute_soft_orthogonality_loss(
         self,
         prototypes: torch.Tensor,
         proto_indices: List[Tuple[int, int]]
     ) -> torch.Tensor:
-        """多样性损失 - 鼓励同类原型捕捉不同模式"""
+        """
+        类内软正交损失 - 替代 Contrastive + Diversity
+
+        目标: 只惩罚相似度超过阈值的原型对，避免过强正交约束。
+        """
         protos_norm = F.normalize(prototypes, p=2, dim=-1)
-        div_loss = 0.0
+        orth_loss = 0.0
         valid_classes = 0
-        
+
         for start, end in proto_indices:
             num_protos = end - start
             if num_protos <= 1:
                 continue
             class_protos = protos_norm[start:end]
-            sim = torch.mm(class_protos, class_protos.t())
-            mask = ~torch.eye(num_protos, device=sim.device).bool()
-            div_loss += F.relu(sim[mask] - 0.5).mean()
+            gram = torch.mm(class_protos, class_protos.t())
+            mask = ~torch.eye(num_protos, device=gram.device).bool()
+            off_diag = gram[mask]
+            orth_loss += F.relu(off_diag.abs() - self.orth_threshold).pow(2).mean()
             valid_classes += 1
-        return div_loss / max(valid_classes, 1)
 
-    def compute_contrastive_loss(
+        return orth_loss / max(valid_classes, 1)
+
+    def compute_local_consistency_loss(
         self,
+        local_feats: torch.Tensor,
+        labels: torch.Tensor,
         prototypes: torch.Tensor,
-        valid_mask: torch.Tensor,
         proto_indices: List[Tuple[int, int]]
     ) -> torch.Tensor:
         """
-        【核心修复】对比损失 - 只推开异类原型
-        原问题: 推开所有原型，与 diversity loss 冲突
-        修复: 只惩罚异类原型之间的相似度
+        局部一致性损失 - 同类样本的原型激活分布应趋于一致
+
+        理论依据:
+        - 同类样本的"最相似 patch"应聚集到相似的原型
+        - 强化多原型头的局部对齐特性
+        - 与软正交配合，提升类内一致性
+
+        实现方式 (可微分):
+        1. 对每个样本的局部 patches，计算与同类原型的相似度
+        2. 用 softmax 得到软分配分布 (可微分，温度可调)
+        3. 同类样本的分布应相似 → 最小化 KL 散度
+
+        Args:
+            local_feats: 局部 patch 特征 (B, L, emb_dim)，L=49 for 7x7 patches
+            labels: 标签 (B,)
+            prototypes: 所有原型 (num_classes * max_prototypes, emb_dim)
+            proto_indices: 每类原型的索引范围
+            local_temperature: softmax 温度 (越小分布越尖锐, 由类内配置提供)
+
+        Returns:
+            局部一致性损失值
         """
-        valid_protos = prototypes[valid_mask]
-        n = valid_protos.size(0)
-        if n <= 1:
+        if local_feats is None:
             return torch.tensor(0.0, device=prototypes.device)
-        
-        protos_norm = F.normalize(valid_protos, p=2, dim=-1)
-        sim_matrix = torch.mm(protos_norm, protos_norm.t())
-        
-        # 构建同类掩码
-        same_class_mask = torch.zeros(n, n, dtype=torch.bool, device=prototypes.device)
-        idx = 0
-        for start, end in proto_indices:
-            num_valid = end - start
-            if idx + num_valid > n:
-                num_valid = n - idx
-            if num_valid > 0:
-                same_class_mask[idx:idx+num_valid, idx:idx+num_valid] = True
-                idx += num_valid
-            if idx >= n:
-                break
-        
-        eye = torch.eye(n, device=prototypes.device).bool()
-        diff_class_mask = ~same_class_mask & ~eye
-        
-        if diff_class_mask.sum() > 0:
-            return sim_matrix[diff_class_mask].mean()
-        return torch.tensor(0.0, device=prototypes.device)
+
+        local_feats_norm = F.normalize(local_feats, p=2, dim=-1)
+        protos_norm = F.normalize(prototypes, p=2, dim=-1)
+
+        consistency_loss = 0.0
+        valid_classes = 0
+
+        for c in range(self.num_classes):
+            mask = (labels == c)
+            if mask.sum() < 2:
+                continue
+
+            start, end = proto_indices[c]
+            num_protos = end - start
+            if num_protos == 0:
+                continue
+
+            class_protos = protos_norm[start:end]
+            class_local_feats = local_feats_norm[mask]
+            N_c = class_local_feats.size(0)
+
+            sim = torch.einsum('nld,pd->nlp', class_local_feats, class_protos)
+            max_sim_per_proto, _ = sim.max(dim=1)
+            soft_assign = F.softmax(max_sim_per_proto / self.local_temperature, dim=-1)
+            mean_dist = soft_assign.mean(dim=0, keepdim=True)
+
+            log_soft_assign = F.log_softmax(max_sim_per_proto / self.local_temperature, dim=-1)
+            kl_loss = F.kl_div(
+                log_soft_assign,
+                mean_dist.expand(N_c, -1),
+                reduction='batchmean'
+            )
+
+            consistency_loss += kl_loss
+            valid_classes += 1
+
+        return consistency_loss / max(valid_classes, 1)
     
     def forward(
         self,
@@ -210,7 +253,8 @@ class OptimalPrototypeLoss(nn.Module):
         labels: torch.Tensor,
         prototypes: torch.Tensor,
         proto_indices: List[Tuple[int, int]],
-        valid_mask: torch.Tensor
+        valid_mask: torch.Tensor,
+        local_feats: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """计算所有损失"""
         distances = 1 - similarities
@@ -220,10 +264,10 @@ class OptimalPrototypeLoss(nn.Module):
             distances, labels, proto_indices) * self.clst_scale
         loss_dict['sep_loss'] = self.compute_separation_loss(
             distances, labels, proto_indices) * self.sep_scale
-        loss_dict['div_loss'] = self.compute_diversity_loss(
-            prototypes, proto_indices) * self.div_scale
-        loss_dict['contrastive_loss'] = self.compute_contrastive_loss(
-            prototypes, valid_mask, proto_indices) * self.contrastive_scale
+        loss_dict['orth_loss'] = self.compute_soft_orthogonality_loss(
+            prototypes, proto_indices) * self.orth_scale
+        loss_dict['local_loss'] = self.compute_local_consistency_loss(
+            local_feats, labels, prototypes, proto_indices) * self.local_scale
         loss_dict['proto_loss'] = sum(loss_dict.values())
         return loss_dict
 
@@ -389,10 +433,11 @@ class HeadOptimal(nn.Module):
     最优多原型分类头
     
     核心改进:
-    1. Contrastive Loss 只推开异类原型
-    2. 三路门控融合
-    3. 标准 EMA 动量更新
-    4. 可选 Class-Balanced 加权
+    1. 类内软正交损失替代 Contrastive + Diversity
+    2. 局部一致性约束: 同类样本的局部 patch 激活分布一致
+    3. 三路门控融合
+    4. 标准 EMA 动量更新
+    5. 可选 Class-Balanced 加权
     
     返回格式:
     - 训练: (logits, total_loss, loss_dict)
@@ -412,8 +457,10 @@ class HeadOptimal(nn.Module):
         temperature: float = 10.0,
         clst_scale: float = 0.8,
         sep_scale: float = 0.08,
-        div_scale: float = 0.01,
-        contrastive_scale: float = 0.05,
+        orth_scale: float = 0.01,
+        orth_threshold: float = 0.3,
+        local_scale: float = 0.01,
+        local_temperature: float = 0.1,
         use_class_balanced: bool = False,
         cb_beta: float = 0.9999,
     ):
@@ -456,8 +503,10 @@ class HeadOptimal(nn.Module):
             margin=margin,
             clst_scale=clst_scale,
             sep_scale=sep_scale,
-            div_scale=div_scale,
-            contrastive_scale=contrastive_scale,
+            orth_scale=orth_scale,
+            orth_threshold=orth_threshold,
+            local_scale=local_scale,
+            local_temperature=local_temperature,
             use_class_balanced=use_class_balanced,
             cb_beta=cb_beta,
         )
@@ -491,6 +540,7 @@ class HeadOptimal(nn.Module):
         
         img_features = self.proj(img_features)
         pool_img_features = self.proj(pool_img_features)
+        local_feats = pool_img_features
         pool_flat = pool_img_features.reshape(1, B * N, self.emb_dim)
         
         prototypes = self.proto_manager.get_prototypes()
@@ -502,7 +552,7 @@ class HeadOptimal(nn.Module):
         class_emb = class_emb.expand(B, -1, -1)
         
         similarities = self.compute_similarities(img_features, class_emb)
-        return similarities, class_emb, attn_weights, img_features
+        return similarities, class_emb, attn_weights, img_features, local_feats
     
     def forward(
         self,
@@ -515,7 +565,7 @@ class HeadOptimal(nn.Module):
         
         【修复】CB 加权现在同时作用于 CE Loss 和 Cluster Loss
         """
-        similarities, class_emb, _, proj_img_features = self.forward_features(
+        similarities, class_emb, _, proj_img_features, local_feats = self.forward_features(
             pool_img_features, img_features
         )
         class_logits = self.aggregate_similarities(similarities)
@@ -534,8 +584,8 @@ class HeadOptimal(nn.Module):
                 labels=labels,
                 prototypes=self.proto_manager.prototypes,
                 proto_indices=self.proto_manager.get_prototype_indices(),
-                valid_mask=self.proto_manager.valid_mask
-            )
+                valid_mask=self.proto_manager.valid_mask,
+                local_feats=local_feats
             )
             
             total_loss = (
