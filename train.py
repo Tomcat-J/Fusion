@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import torch
+import json
 
 import math
 from contextlib import suppress
@@ -33,15 +34,19 @@ from mae_lite.utils import (
 )
 from mae_lite.utils.torch_dist import parse_devices, configure_nccl, all_reduce_mean, synchronize
 from mae_lite.exps import timm_imagenet_exp
+from projects.mae_lite import mae_lite_distill_exp
+from projects.eval_tools import finetuning_exp, finetuning_transfer_exp
+from projects.mae_lite.temp_global import Global_T
 
 
 def get_arg_parser():
     parser = argparse.ArgumentParser("Training")
     # distributed
     parser.add_argument("--dist-backend", default="nccl", type=str, help="distributed backend")
-    parser.add_argument("--dist-url", default=None, type=str, help="url used to set up distributed training, e.g. 'tcp://127.0.0.1:8686'.")
+    parser.add_argument("--dist-url", default=None, type=str,
+                        help="url used to set up distributed training, e.g. 'tcp://127.0.0.1:8686'.")
     parser.add_argument("-b", "--batch-size", type=int, default=32, help="batch size")
-    parser.add_argument("-e", "--max_epoch", type=int, default=400, help="max_epoch for training")
+    parser.add_argument("-e", "--max_epoch", type=int, default=100, help="max_epoch for training")
     parser.add_argument("-d", "--devices", default="0", type=str, help="device for training")
     parser.add_argument(
         "-eval",
@@ -55,27 +60,78 @@ def get_arg_parser():
         "-f",
         "--exp_file",
         # default=timm_imagenet_exp.__file__,
-        default="finetuning_exp.py",
+        # default=mae_lite_distill_exp.__file__,
+        default= finetuning_exp.__file__,
+        # default=finetuning_transfer_exp.__file__,
         type=str,
         help="pls input your expriment description file",
     )
     parser.add_argument(
         "--resume", dest="resume", nargs="?", default=argparse.SUPPRESS, type=str, help="path to latest checkpoint"
     )
-    parser.add_argument("--ckpt", type=str, help="checkpoint for initialization")
+    parser.add_argument("--ckpt", default="/home/backup/lh/KD/projects/mae_lite/checkpoints/HiFuse_ImageNet1K.pth",
+                        type=str, help="checkpoint for initialization")
     parser.add_argument("--amp", action="store_true", help="enable automatic mixed precision training")
     parser.add_argument(
         "--exp-options",
-        # pretrain_exp_name="mae_lite/mae_base_ft_400e",
         nargs="+",
         action=DictAction,
         help="override some settings in the exp, the key-value pair in xxx=yyy format will be merged into exp. "
-        'If the value to be overwritten is a list, it should be like key="[a,b]" or key=a,b '
-        'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
-        "Note that the quotation marks are necessary and that no white space is allowed.",
+             'If the value to be overwritten is a list, it should be like key="[a,b]" or key=a,b '
+             'It also allows nested list/tuple values, e.g. key="[(a,b),(c,d)]" '
+             "Note that the quotation marks are necessary and that no white space is allowed.",
     )
+
+    # CTKD distillation
+    # parser.add_argument('--have_mlp', type=int, default=1)
+    # parser.add_argument('--mlp_name', type=str, default='global')
+    # parser.add_argument('--cosine_decay', type=int, default=1)
+    # parser.add_argument('--decay_max', type=float, default=0)
+    # parser.add_argument('--decay_min', type=float, default=-1)
+    # parser.add_argument('--decay_loops', type=float, default=10)
+
     args = parser.parse_args()
     return args
+
+
+class CosineDecay(object):
+    def __init__(self,
+                 max_value,
+                 min_value,
+                 num_loops):
+        self._max_value = max_value
+        self._min_value = min_value
+        self._num_loops = num_loops
+
+    def get_value(self, i):
+        if i < 0:
+            i = 0
+        if i >= self._num_loops:
+            i = self._num_loops
+        value = (math.cos(i * math.pi / self._num_loops) + 1.0) * 0.5
+        value = value * (self._max_value - self._min_value) + self._min_value
+        return value
+
+
+class LinearDecay(object):
+    def __init__(self,
+                 max_value,
+                 min_value,
+                 num_loops):
+        self._max_value = max_value
+        self._min_value = min_value
+        self._num_loops = num_loops
+
+    def get_value(self, i):
+        if i < 0:
+            i = 0
+        if i >= self._num_loops:
+            i = self._num_loops - 1
+
+        value = (self._max_value - self._min_value) / self._num_loops
+        value = i * (-value)
+
+        return value
 
 
 def main():
@@ -109,7 +165,7 @@ def main():
                     with open(ip_add_file, "r") as ip_add:
                         dist_url = ip_add.readline()
                     args.dist_url = dist_url
-            
+
         processes = []
         for rank in range(nr_gpu):
             p = mp.Process(target=main_worker, args=(rank, nr_gpu, args))
@@ -179,6 +235,20 @@ def main_worker(gpu, nr_gpu, args):
     eval_loader = data_loader.get("eval", None)
     active_eval = args.eval and eval_loader is not None
     model = exp.get_model()
+    # temp_mlp = None
+    #
+    # if args.have_mlp:
+    #     if args.mlp_name == 'global':
+    #         temp_mlp = Global_T()
+    #     else:
+    #         print('temp_mlp name wrong')
+    # if args.cosine_decay:
+    #     gradient_decay = CosineDecay(max_value=args.decay_max, min_value=args.decay_min, num_loops=args.decay_loops)
+    # else:
+    #     gradient_decay = LinearDecay(max_value=args.decay_max, min_value=args.decay_min, num_loops=args.decay_loops)
+    #
+    # decay_value = 1
+
     if rank == 0:
         logger.info("Illustration of model strcutures:\n{}".format(str(model)))
     optimizer = exp.get_optimizer()
@@ -192,7 +262,7 @@ def main_worker(gpu, nr_gpu, args):
     # ------------------------ start training ------------------------------------------------------------ #
     ITERS_PER_EPOCH = len(train_loader)
     BEST_TOP1_ACC = 0.0
-    BEST_TOP5_ACC = 0.0
+    BEST_TOP3_ACC = 0.0
     BEST_TOP1_EPOCH = 0
     start_epoch = 0
 
@@ -208,7 +278,7 @@ def main_worker(gpu, nr_gpu, args):
     #  ------------------------------------------- load ckpt ------------------------------------ #
     if "resume" in args:
         if args.resume is None:
-            args.resume = "last_epoch_ckpt.checkpoints.tar"
+            args.resume = "last_epoch_ckpt.pth.tar"
             resume_path = os.path.join(file_name, args.resume)
         if os.path.isfile(args.resume):
             resume_path = args.resume
@@ -227,7 +297,7 @@ def main_worker(gpu, nr_gpu, args):
             scaler.load_state_dict(ckpt.get("scaler", {}))
             scheduler.load_state_dict(ckpt.get("scheduler", {}))
             BEST_TOP1_ACC = ckpt.get("best_top1", 0.0)
-            BEST_TOP5_ACC = ckpt.get("best_top5", 0.0)
+            BEST_TOP3_ACC = ckpt.get("best_top3", 0.0)
             BEST_TOP1_EPOCH = ckpt.get("best_top1_epoch", 0)
             logger.info(
                 "\tloaded successfully (epoch={}, BEST_TOP1_ACC={}(epoch={}))".format(
@@ -263,8 +333,14 @@ def main_worker(gpu, nr_gpu, args):
             data_time = time.time() - iter_start_time
 
             optimizer.zero_grad()
+            # if args.have_mlp:
+            #     decay_value = gradient_decay.get_value(epoch)
             with autocast():
-                loss, extra_dict = model(inps, target=target)
+            # losses_dict, extra_dict, temp = model(inps, target=target, epoch=epoch, temp_mlp=temp_mlp,
+                                                      # cos_value=decay_value)
+                loss, extra_dict = model(inps, target=target, epoch=epoch)
+            # backward
+            # loss = sum([l.mean() for l in losses_dict.values()])
             loss_value = all_reduce_mean(loss).item()
             extra_dict = {k: all_reduce_mean(v) for k, v in extra_dict.items()} if extra_dict else None
             if not math.isfinite(loss_value):
@@ -288,7 +364,7 @@ def main_worker(gpu, nr_gpu, args):
                 max_mem_mb = torch.cuda.max_memory_allocated() / 1024.0 / 1024.0
 
                 log_str = (
-                    "[{}/{}], remain:{}, It:[{}/{}], Max-Mem:{:.0f}M, Data-Time:{:.3f}, LR:{}, Loss:{:.4f}".format(
+                    "[{}/{}], remain:{}, It:[{}/{}], Max-Mem:{:.0f}M, Data-Time:{:.3f}, LR:{}, Train_Loss:{:.4f}".format(
                         epoch + 1,
                         exp.max_epoch,
                         remain_time,
@@ -339,34 +415,32 @@ def main_worker(gpu, nr_gpu, args):
             except Exception as e:
                 if rank == 0:
                     logger.warning(f"Prototype push failed: {e}")
-        
+
         # ----------------------------------------- evaluate --------------------------------------- #
         is_best = False
         if active_eval:
-            if (epoch + 1) % exp.eval_interval == 0:
-                model.eval()
-                # run_eval 返回: (top1, top3, precision, recall, f1, specificity, loss)
-                eval_results = run_eval(model, eval_loader)
-                eval_top1, eval_top5 = eval_results[0], eval_results[1]
-                if rank == 0:
-                    logger.info(
-                        "\tEval-Epoch: [{}/{}], Top1:{:.3f}, Top5:{:.3f}".format(
-                            epoch + 1, exp.max_epoch, eval_top1, eval_top5
-                        )
+            model.eval()
+            eval_top1, eval_top3, precision, recall, f1, specificity, loss = run_eval(model, eval_loader)
+            if rank == 0:
+                logger.info(
+                    "\tEval-Epoch: [{}/{}], Top1:{:.3f}, Top3:{:.3f}, Test_precision:{:.4f},Test_recall:{:.4f},Test_f1:{:.4f},,Test_specificity:{:.4f} Test_loss:{:.6f}".format(
+                        epoch + 1, exp.max_epoch, eval_top1, eval_top3,precision,
+                        recall,f1,specificity, loss
                     )
-                    if eval_top1 > BEST_TOP1_ACC:
-                        BEST_TOP1_ACC = eval_top1
-                        BEST_TOP5_ACC = eval_top5
-                        BEST_TOP1_EPOCH = epoch + 1
-                        is_best = True
-                    logger.info(
-                        "\tBest Top1 at epoch [{}/{}], Top1:{:.3f}, Top-5:{:.3f}".format(
-                            BEST_TOP1_EPOCH, exp.max_epoch, BEST_TOP1_ACC, BEST_TOP5_ACC
-                        )
+                )
+                if eval_top1 > BEST_TOP1_ACC:
+                    BEST_TOP1_ACC = eval_top1
+                    BEST_TOP3_ACC = eval_top3
+                    BEST_TOP1_EPOCH = epoch + 1
+                    is_best = True
+                logger.info(
+                    "\tBest Top1 at epoch [{}/{}], Top1:{:.3f}, Top-3:{:.3f}".format(
+                        BEST_TOP1_EPOCH, exp.max_epoch, BEST_TOP1_ACC, BEST_TOP3_ACC
                     )
-                    if tb_writer:
-                        tb_writer.add_scalar("Val/Top1", eval_top1, (epoch + 1) * ITERS_PER_EPOCH)
-                        tb_writer.add_scalar("Val/Top5", eval_top5, (epoch + 1) * ITERS_PER_EPOCH)
+                )
+                if tb_writer:
+                    tb_writer.add_scalar("Val/Top1", eval_top1, (epoch + 1) * ITERS_PER_EPOCH)
+                    tb_writer.add_scalar("Val/Top3", eval_top3, (epoch + 1) * ITERS_PER_EPOCH)
 
         # ----------------------------------------- dump weights ----------------------------------- #
         if rank == 0 and (is_best or (epoch + 1) % exp.dump_interval == 0 or (epoch + 1) == exp.max_epoch):
@@ -377,19 +451,33 @@ def main_worker(gpu, nr_gpu, args):
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "best_top1": BEST_TOP1_ACC,
-                "best_top5": BEST_TOP5_ACC,
+                "best_top3": BEST_TOP3_ACC,
                 "best_top1_epoch": BEST_TOP1_EPOCH,
                 "scaler": scaler.state_dict()
+                # 'temp': json.dumps(temp.cpu().detach().numpy()[0].tolist()),
+                # 'decay_value': decay_value
             }
-            save_checkpoint(ckpt, is_best, file_name, "last_epoch")
-
+            save_checkpoint(ckpt, is_best, file_name, "last_epoch") \
+                # # 每个 epoch 结束时打印准确度
+        # if active_eval:
+        #     model.eval()
+        #     eval_top1, eval_top5 = run_eval(model, eval_loader)
+        #     if rank == 0:
+        #         logger.info(
+        #             "Epoch: [{}/{}], Training Accuracy - Top1: {:.3f}, Top5: {:.3f}".format(
+        #                 epoch + 1, exp.max_epoch, eval_top1, eval_top5
+        #             )
+        #         )
+        #         if tb_writer:
+        #             tb_writer.add_scalar("Accuracy/Top1", eval_top1, (epoch + 1) * ITERS_PER_EPOCH)
+        #             tb_writer.add_scalar("Accuracy/Top5", eval_top5, (epoch + 1) * ITERS_PER_EPOCH)
     # ---------------------------------------- end of the training -------------------------------- #
     if rank == 0:
         logger.info("Training of experiment: {} is done.".format(exp.exp_name))
         if active_eval:
             logger.info(
-                "\tBest Top1 at epoch [{}/{}], Top1:{:.3f}, Top5:{:.3f}".format(
-                    BEST_TOP1_EPOCH, exp.max_epoch, BEST_TOP1_ACC, BEST_TOP5_ACC
+                "\tBest Top1 at epoch [{}/{}], Top1:{:.3f}, Top3:{:.3f}".format(
+                    BEST_TOP1_EPOCH, exp.max_epoch, BEST_TOP1_ACC, BEST_TOP3_ACC
                 )
             )
         logger.stop()
