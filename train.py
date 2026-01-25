@@ -313,11 +313,49 @@ def main_worker(gpu, nr_gpu, args):
 
     scheduler.step(start_epoch * ITERS_PER_EPOCH)
 
+    # ----------------------------------------- Backbone Freezing 设置 --------------------------------- #
+    freeze_backbone_epochs = getattr(exp, 'freeze_backbone_epochs', 0)
+    backbone_frozen = False
+    
+    # 获取内部模型 (穿透 DDP 和 Model wrapper)
+    if hasattr(model, 'module'):
+        wrapper_model = model.module  # DDP wrapper
+    else:
+        wrapper_model = model
+    
+    if hasattr(wrapper_model, 'model'):
+        inner_model = wrapper_model.model  # Model wrapper 内部的 main_model
+    else:
+        inner_model = wrapper_model
+    
+    # 如果设置了 freeze_backbone_epochs 且从头开始训练，冻结 backbone
+    if freeze_backbone_epochs > 0 and start_epoch < freeze_backbone_epochs:
+        if hasattr(inner_model, 'freeze_backbone'):
+            inner_model.freeze_backbone()
+            backbone_frozen = True
+            if rank == 0:
+                logger.info(f"Backbone frozen for first {freeze_backbone_epochs} epochs (Head warmup)")
+        else:
+            if rank == 0:
+                logger.warning("Model does not have freeze_backbone method, skipping backbone freezing")
+
     prefetcher = DataPrefetcher(train_loader, data_format=exp.data_format)
     for epoch in range(start_epoch, exp.max_epoch):
         batch_time_meter = AvgMeter()
         if rank == 0:
             logger.info("---> start train epoch{}".format(epoch + 1))
+
+        # ----------------------------------------- Backbone 解冻检查 --------------------------------- #
+        # 在 freeze_backbone_epochs 结束后解冻 backbone
+        if backbone_frozen and epoch >= freeze_backbone_epochs:
+            if hasattr(inner_model, 'unfreeze_backbone'):
+                inner_model.unfreeze_backbone()
+                backbone_frozen = False
+                if rank == 0:
+                    logger.info(f"Backbone unfrozen at epoch {epoch + 1} (Head warmup completed)")
+            else:
+                if rank == 0:
+                    logger.warning("Model does not have unfreeze_backbone method")
 
         if prefetcher.next_input is None:
             if nr_gpu > 1:
@@ -388,9 +426,16 @@ def main_worker(gpu, nr_gpu, args):
                             tb_writer.add_scalar(k, v, iter_count)
 
         # ----------------------------------------- push prototypes --------------------------------- #
-        # 每隔一定 epoch 执行原型推送 (ProtoPNet 核心机制)
-        push_interval = getattr(exp, 'push_interval', 10)  # 默认每10个epoch推送一次
-        push_start_epoch = getattr(exp, 'push_start_epoch', 5)  # 默认从第5个epoch开始push
+        # 优化的原型推送策略 (避免 cooldown 阶段 push)
+        push_interval = getattr(exp, 'push_interval', 15)  # 默认每15个epoch推送一次
+        push_start_epoch = getattr(exp, 'push_start_epoch', 20)  # 默认从第20个epoch开始push
+        push_end_epoch = getattr(exp, 'push_end_epoch', exp.max_epoch - 50)  # 默认在最后50个epoch前停止push
+        push_momentum = getattr(exp, 'push_momentum', 0.95)  # 高动量=渐进式更新
+        
+        # 获取当前学习率，判断是否在 cooldown 阶段
+        current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else self.lr
+        min_lr_threshold = getattr(exp, 'min_lr', 1e-6) * 10  # LR 低于此值视为 cooldown
+        is_cooldown = current_lr < min_lr_threshold
         
         # 获取内部模型 (需要穿透 DDP 和 Model wrapper)
         if hasattr(model, 'module'):
@@ -404,17 +449,38 @@ def main_worker(gpu, nr_gpu, args):
         else:
             inner_model = wrapper_model
         
-        # 检查内部模型是否有 push_prototypes 方法
-        if hasattr(inner_model, 'push_prototypes') and (epoch + 1) >= push_start_epoch and (epoch + 1) % push_interval == 0:
+        # 检查是否应该执行 push
+        should_push = (
+            hasattr(inner_model, 'push_prototypes') and
+            (epoch + 1) >= push_start_epoch and
+            (epoch + 1) <= push_end_epoch and
+            (epoch + 1) % push_interval == 0 and
+            not is_cooldown  # 关键: 避免在 cooldown 阶段 push
+        )
+        
+        if should_push:
             if rank == 0:
-                logger.info("---> Pushing prototypes at epoch {}".format(epoch + 1))
+                logger.info("---> Pushing prototypes at epoch {} (LR={:.6f}, momentum={})".format(
+                    epoch + 1, current_lr, push_momentum))
             try:
-                inner_model.push_prototypes(train_loader, gpu)
+                inner_model.push_prototypes(train_loader, gpu, momentum=push_momentum)
                 if rank == 0:
-                    logger.info("---> Prototype push completed")
+                    logger.info("---> Prototype push completed (gradual update with momentum={})".format(push_momentum))
             except Exception as e:
                 if rank == 0:
                     logger.warning(f"Prototype push failed: {e}")
+        elif hasattr(inner_model, 'push_prototypes') and (epoch + 1) % push_interval == 0:
+            # 记录为什么跳过 push
+            if rank == 0:
+                skip_reason = []
+                if (epoch + 1) < push_start_epoch:
+                    skip_reason.append(f"epoch < push_start({push_start_epoch})")
+                if (epoch + 1) > push_end_epoch:
+                    skip_reason.append(f"epoch > push_end({push_end_epoch})")
+                if is_cooldown:
+                    skip_reason.append(f"cooldown phase (LR={current_lr:.6f})")
+                if skip_reason:
+                    logger.info("---> Skipping prototype push: {}".format(", ".join(skip_reason)))
 
         # ----------------------------------------- evaluate --------------------------------------- #
         is_best = False
