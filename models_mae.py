@@ -662,7 +662,8 @@ from typing import Optional
 from timm.models import register_model
 from timm.models.vision_transformer import Block as Blockmeta
 
-from projects.mae_lite.head import *
+# 使用优化版多原型分类头 (含软正交损失、局部一致性损失、CB加权)
+from projects.mae_lite.head_optimal import HeadOptimal as Head, create_optimal_head_for_main_model
 
 
 def drop_path_f(x, drop_prob: float = 0., training: bool = False):
@@ -822,8 +823,19 @@ class main_model(nn.Module):
 
         self.norm = norm_layer(self.num_features)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
-        self.head = Head(self.num_classes, conv_dims[-1], num_heads[2],
-                         conv_dims[-1]) if num_classes > 0 else nn.Identity()
+        # 使用优化版多原型分类头 (HeadOptimal)
+        # 特性: 软正交损失、局部一致性损失、CB加权、高动量push
+        self.head = Head(
+            num_classes=self.num_classes,
+            emb_dim=conv_dims[-1],
+            num_heads=num_heads[2],
+            img_feat_dim=conv_dims[-1],
+            num_prototypes=5,           # 每类初始原型数
+            max_prototypes=10,          # 每类最大原型数
+            use_class_balanced=True,    # 启用 Class-Balanced 加权
+            cb_beta=0.9999,             # CB 系数
+            local_consistency_scale=0.05,  # 局部一致性损失权重
+        ) if num_classes > 0 else nn.Identity()
         # self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
         self.apply(self._init_weights)
 
@@ -2006,8 +2018,9 @@ def HiFuse_Tiny_Enhanced(num_classes: int, enhancement_reduction: float = 0.0625
 
 
 @register_model
-def HiFuse_Small_Enhanced(num_classes: int, enhancement_reduction: float = 0.0625, pretrained=False):
+def HiFuse_Small_Enhanced(num_classes: int, enhancement_reduction: float = 0.0625, pretrained=False, **kwargs):
     """增强版HiFuse_Small"""
+    # kwargs 接受但忽略 drop_rate, drop_path_rate, attn_drop_rate, drop_block_rate, global_pool 等参数
     model = main_model_enhanced(depths=(2, 2, 6, 2),
                                 conv_depths=(3, 3, 9, 3),
                                 num_classes=num_classes,
@@ -2016,8 +2029,9 @@ def HiFuse_Small_Enhanced(num_classes: int, enhancement_reduction: float = 0.062
 
 
 @register_model
-def HiFuse_Base_Enhanced(num_classes: int, enhancement_reduction: float = 0.0625, pretrained=False):
+def HiFuse_Base_Enhanced(num_classes: int, enhancement_reduction: float = 0.0625, pretrained=False, **kwargs):
     """增强版HiFuse_Base"""
+    # kwargs 接受但忽略 drop_rate, drop_path_rate, attn_drop_rate, drop_block_rate, global_pool 等参数
     model = main_model_enhanced(depths=(2, 2, 18, 2),
                                 conv_depths=(2, 2, 18, 2),
                                 num_classes=num_classes,
