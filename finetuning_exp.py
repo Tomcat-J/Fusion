@@ -23,7 +23,7 @@ class Exp(BaseExp):
         
         # ===== MHF Enhancement Settings (Task 12) =====
         # Requirements: 6.3
-        self.use_mhf_enhancement = False  # 是否启用MHF增强
+        self.use_mhf_enhancement = True  # 是否启用MHF增强
         self.enhancement_reduction = 0.0625  # 增强模块通道缩减比例 (1/16)
         
         # 差异化学习率设置
