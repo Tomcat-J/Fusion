@@ -48,7 +48,7 @@ class Exp(BaseExp):
         
         # ===== 优化器设置 =====
         self.opt = "adamw"
-        self.weight_decay = 0.05
+        self.weight_decay = 0.03
         self.clip_grad = 1.0
         self.clip_mode = "norm"
 
@@ -58,35 +58,35 @@ class Exp(BaseExp):
         self.reprob = 0.25
         self.remode = "pixel"
         self.recount = 1
-        self.mixup = 0.0
-        self.cutmix = 0.0
+        self.mixup = 0.15
+        self.cutmix = 0.15
         self.smoothing = 0.1
-        self.drop_path = 0.1
+        self.drop_path = 0.2
         
         # ===== 学习率设置 =====
         self.basic_lr_per_img = 1e-4 / 32
         
         # ===== 差异化学习率 =====
-        self.backbone_lr_scale = 0.01    # backbone 几乎冻结
-        self.mhf_lr_scale = 0.1          # MHF 低学习率
-        self.enhancement_lr_scale = 5.0  # 增强模块高学习率
-        self.head_lr_scale = 1.0         # head 整体学习率
+        self.backbone_lr_scale = 0.05    # backbone 低学习率
+        self.mhf_lr_scale = 0.2          # MHF 中低学习率
+        self.enhancement_lr_scale = 3.0  # 增强模块中高学习率
+        self.head_lr_scale = 2.0         # head 提升学习率
         
         # ===== 学习率调度 =====
         self.sched = "warmcos_scale"
-        self.warmup_epochs = 5
-        self.warmup_lr = 1e-7
+        self.warmup_epochs = 3
+        self.warmup_lr = 1e-6
         self.min_lr = 1e-7
         self.cooldown_epochs = 10
 
         # ===== 冻结策略 =====
-        self.freeze_backbone_epochs = 10  # 前 10 epochs 冻结 backbone
+        self.freeze_backbone_epochs = 3  # 前 3 epochs 冻结 backbone
         
         # ===== Prototype Push 策略 =====
-        self.push_start_epoch = 15
-        self.push_interval = 10
-        self.push_end_epoch = 90
-        self.push_momentum = 0.9
+        self.push_start_epoch = 12
+        self.push_interval = 8
+        self.push_end_epoch = 88
+        self.push_momentum = 0.85
 
         # ===== EMA =====
         self.model_ema = True
